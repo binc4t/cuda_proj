@@ -1,18 +1,31 @@
+/*
+1. 使用reduce替代手动规约
+2. 明确指明使用float，例如fminf, fmaxf的优化
+3. 减少分支，利于CPU SIMD优化
+4. 因为核函数内存不重叠，因此加上const, __restrict__优化
+5. 用宏进行cuda api错误检查，以及检查核函数错误，待补充
+*/
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/reduce.h>
+#include <cub/cub.cuh>
+
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
 using namespace std;
-using namespace cv;
 
 namespace {
 const int kThreshold = 100;
 const float kAlpha = 1.0;
 const float kBeta = 5.0;
-const int kN = 3;  // 每个thread计算相邻 kN 个像素点，kN是并发度的反比
 }  // namespace
 
-__global__ void binarization(uchar* data, uchar* output, const int rows,
-                             const int cols) {
+__global__ void BinarizationKernel(const uchar* __restrict__ input,
+                                   uchar* __restrict__ output, const int rows,
+                                   const int cols) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -21,15 +34,12 @@ __global__ void binarization(uchar* data, uchar* output, const int rows,
   }
 
   const int idx = y * cols + x;
-  int p = 0;
-  if (data[idx] > kThreshold) {
-    p = 255;
-  }
-  output[idx] = p;
+  output[idx] = (input[idx] > kThreshold) ? 255 : 0;
 }
 
-__global__ void transform(uchar* data, uchar* output, const int rows,
-                          const int cols) {
+__global__ void TransformKernel(const uchar* __restrict__ input,
+                                uchar* __restrict__ output, const int rows,
+                                const int cols) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -38,43 +48,13 @@ __global__ void transform(uchar* data, uchar* output, const int rows,
   }
 
   const int idx = y * cols + x;
-  int p = kAlpha * sqrt(static_cast<float>(data[idx])) + kBeta;
-  if (p >= 255) {
-    p = 255;
-  }
-  output[idx] = p;
-}
-
-__global__ void avg(uchar* data, int* avg_arr, const int rows, const int cols,
-                    const int size) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-  if (x >= cols || y >= rows) {
-    return;
-  }
-
-  const int idx = y * cols + x;
-  if (idx % kN != 0) {
-    return;
-  }
-  const int arr_idx = idx / kN;  // 当前计算结果在返回数组中的下标
-
-  int cur = 0;
-  int cur_idx = 0;
-  for (int i = 0; i < kN; ++i) {
-    cur_idx = idx + i;
-    if (cur_idx >= size) {
-      break;
-    }
-    cur += data[cur_idx];
-  }
-  avg_arr[arr_idx] = cur;
+  float val = kAlpha * sqrtf(static_cast<float>(input[idx])) + kBeta;
+  output[idx] = static_cast<uchar>(fminf(fmaxf(val, 0.0f), 255.0f));
 }
 
 int main() {
   const string image_path = "./img.png";
-  Mat img = imread(image_path, IMREAD_GRAYSCALE);
+  cv::Mat img = cv::imread(image_path, cv::IMREAD_GRAYSCALE);
   const int img_size = img.rows * img.cols;
   const int m = img_size * sizeof(uchar);
 
@@ -86,57 +66,44 @@ int main() {
   cudaMemcpy(d_input, img.data, m, cudaMemcpyHostToDevice);
 
   const dim3 block_size = dim3(16, 16);
-  const dim3 grid_size = dim3((img.rows + 15) / 16, (img.cols + 15) / 16);
+  const dim3 grid_size = dim3((img.cols + 15) / 16, (img.rows + 15) / 16);
 
   // to binary
-  binarization<<<grid_size, block_size>>>(d_input, d_output, img.rows,
-                                          img.cols);
+  BinarizationKernel<<<grid_size, block_size>>>(d_input, d_output, img.rows,
+                                                img.cols);
   cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost);
-  Mat binary_img(img.rows, img.cols, CV_8UC1, h_output);
+  cv::Mat binary_img(img.rows, img.cols, CV_8UC1, h_output);
   if (binary_img.empty()) {
     return 1;
   }
-  imwrite("binary.png", binary_img);
+  cv::imwrite("binary.png", binary_img);
 
   // cal avg origin image
-  const int arr_size = ((img_size + kN - 1) / kN) * sizeof(int);
-  int* h_avg_arr = (int*)malloc(arr_size);
-  int* d_avg_arr;
-  cudaMalloc((void**)&d_avg_arr, arr_size);
-  avg<<<grid_size, block_size>>>(d_input, d_avg_arr, img.rows, img.cols,
-                                 img_size);
-  cudaMemcpy(h_avg_arr, d_avg_arr, arr_size, cudaMemcpyDeviceToHost);
-  float avg_ret = 0.0;
-  for (int i = 0; i < (img_size + kN - 1) / kN; ++i) {
-    avg_ret += h_avg_arr[i];
-  }
-  avg_ret /= img_size;
-  printf("avg_ret origion is %.3f\n", avg_ret);
+  thrust::device_ptr<uchar> t_input(d_input);
+  unsigned long long sum_origin =
+      thrust::reduce(t_input, t_input + img_size, (unsigned long long)0);
+  double avg_origin = static_cast<double>(sum_origin) / img_size;
+  printf("avg_origin is %.3f\n", avg_origin);
 
   // transform
-  transform<<<grid_size, block_size>>>(d_input, d_output, img.rows, img.cols);
+  TransformKernel<<<grid_size, block_size>>>(d_input, d_output, img.rows,
+                                             img.cols);
   cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost);
-  Mat transform_img(img.rows, img.cols, CV_8UC1, h_output);
+  cv::Mat transform_img(img.rows, img.cols, CV_8UC1, h_output);
   if (transform_img.empty()) {
     return 1;
   }
   imwrite("transform.png", transform_img);
 
   // cal avg after transform
-  avg<<<grid_size, block_size>>>(d_output, d_avg_arr, img.rows, img.cols,
-                                 img_size);
-  cudaMemcpy(h_avg_arr, d_avg_arr, arr_size, cudaMemcpyDeviceToHost);
-  avg_ret = 0.0;
-  for (int i = 0; i < (img_size + kN - 1) / kN; ++i) {
-    avg_ret += h_avg_arr[i];
-  }
-  avg_ret /= img_size;
-  printf("avg_ret after transform is %.3f\n", avg_ret);
+  thrust::device_ptr<uchar> t_output(d_output);
+  unsigned long long sum_transform =
+      thrust::reduce(t_output, t_output + img_size, (unsigned long long)0);
+  double avg_transform = static_cast<double>(sum_transform) / img_size;
+  printf("avg_transform is %.3f\n", avg_transform);
 
   free(h_output);
-  free(h_avg_arr);
   cudaFree(d_input);
   cudaFree(d_output);
-  cudaFree(d_avg_arr);
   return 0;
 }
