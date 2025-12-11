@@ -13,7 +13,20 @@
 #include <cub/cub.cuh>
 
 #include <iostream>
+#include <cstdio>
+#include <cstdlib>
 #include <opencv2/opencv.hpp>
+
+// CUDA错误检查宏
+#define CUDA_CHECK(call) \
+  do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+              cudaGetErrorString(err)); \
+      exit(1); \
+    } \
+  } while(0)
 
 using namespace std;
 
@@ -61,9 +74,9 @@ int main() {
   uchar* d_input;
   uchar* d_output;
   uchar* h_output = (uchar*)malloc(m);
-  cudaMalloc((void**)&d_input, m);
-  cudaMalloc((void**)&d_output, m);
-  cudaMemcpy(d_input, img.data, m, cudaMemcpyHostToDevice);
+  CUDA_CHECK(cudaMalloc((void**)&d_input, m));
+  CUDA_CHECK(cudaMalloc((void**)&d_output, m));
+  CUDA_CHECK(cudaMemcpy(d_input, img.data, m, cudaMemcpyHostToDevice));
 
   const dim3 block_size = dim3(16, 16);
   const dim3 grid_size = dim3((img.cols + 15) / 16, (img.rows + 15) / 16);
@@ -71,7 +84,8 @@ int main() {
   // to binary
   BinarizationKernel<<<grid_size, block_size>>>(d_input, d_output, img.rows,
                                                 img.cols);
-  cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost);
+  CUDA_CHECK_KERNEL();
+  CUDA_CHECK(cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost));
   cv::Mat binary_img(img.rows, img.cols, CV_8UC1, h_output);
   if (binary_img.empty()) {
     return 1;
@@ -88,7 +102,7 @@ int main() {
   // transform
   TransformKernel<<<grid_size, block_size>>>(d_input, d_output, img.rows,
                                              img.cols);
-  cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost);
+  CUDA_CHECK(cudaMemcpy(h_output, d_output, m, cudaMemcpyDeviceToHost));
   cv::Mat transform_img(img.rows, img.cols, CV_8UC1, h_output);
   if (transform_img.empty()) {
     return 1;
@@ -103,7 +117,7 @@ int main() {
   printf("avg_transform is %.3f\n", avg_transform);
 
   free(h_output);
-  cudaFree(d_input);
-  cudaFree(d_output);
+  CUDA_CHECK(cudaFree(d_input));
+  CUDA_CHECK(cudaFree(d_output));
   return 0;
 }
